@@ -1,7 +1,3 @@
-// Copyright (c) FIRST and other WPILib contributors.
-// Open Source Software; you can modify and/or share it under the terms of
-// the WPILib BSD license file in the root directory of this project.
-
 package frc.robot;
 
 import static java.lang.Math.*;
@@ -13,161 +9,381 @@ import com.ctre.phoenix6.signals.MotorAlignmentValue;
 import com.ctre.phoenix6.signals.NeutralModeValue;
 import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.networktables.BooleanPublisher;
+import edu.wpi.first.networktables.BooleanSubscriber;
+import edu.wpi.first.networktables.DoublePublisher;
+import edu.wpi.first.networktables.DoubleSubscriber;
+import edu.wpi.first.networktables.IntegerPublisher;
+import edu.wpi.first.networktables.IntegerSubscriber;
+import edu.wpi.first.networktables.NetworkTable;
+import edu.wpi.first.networktables.NetworkTableInstance;
+import edu.wpi.first.networktables.StringSubscriber;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import edu.wpi.first.wpilibj2.command.InstantCommand;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
-import java.util.ArrayList;
-import java.util.List;
 import org.littletonrobotics.junction.LoggedRobot;
 import org.littletonrobotics.junction.Logger;
 import org.littletonrobotics.junction.networktables.NT4Publisher;
-import org.photonvision.PhotonCamera;
-import org.photonvision.targeting.PhotonPipelineResult;
-import org.photonvision.targeting.PhotonTrackedTarget;
 
+/**
+ * Robot implementing the BallTracker NetworkTables protocol.
+ *
+ * <p>The robot coordinates with a camera-side Python program that tracks yellow
+ * ball trajectories. Communication happens over NT4 under the /BallTracker/ table.
+ *
+ * <p>See protocol.md for the full specification.
+ */
 public class Robot extends LoggedRobot {
-	private Command m_autonomousCommand;
 
-	private final RobotContainer m_robotContainer;
+	// ── Hardware ────────────────────────────────────────────────────────────
+	/** Flywheel primary motor (CAN 0). */
+	private TalonFX flywheel;
+	/** Flywheel follower motor (CAN 2, opposed). */
+	private TalonFX flywheel2;
+	/** Hood / pivot motor (CAN 1). */
+	private TalonFX hood;
+	/** Indexer motor to feed balls into the shooter (CAN 3). */
+	private TalonFX indexer;
 
-	// public static SparkFlex motor;
-	public static TalonFX motor, motor2;
-	public static TalonFX hood;
-	// public CommandJoystick left_js = new CommandJoystick(4);
-	// public CommandJoystick right_js = new CommandJoystick(3);
-	// public CommandJoystick ds = new CommandJoystick(2);
-	public CommandXboxController controller = new CommandXboxController(1);
+	// ── Controls ────────────────────────────────────────────────────────────
+	private final CommandXboxController controller = new CommandXboxController(1);
 
-	public PhotonCamera camera;
+	// ── PID ─────────────────────────────────────────────────────────────────
+	private final PIDController flywheelPid = new PIDController(0, 0, 0);
+	private final PIDController hoodPid = new PIDController(0.5, 0.1, 0);
 
-	// PIDController pid = new PIDController(3.596, 0, 0);
-	// PIDController pid = new PIDController(6e-3, 0, 2.5e-4);
-	PIDController pid = new PIDController(0, 0, 0);
-	PIDController hpid = new PIDController(0.5, 0.1, 0);
+	// ── Feedforward constants ───────────────────────────────────────────────
+	public static final double MOTOR_kV = 0.0019203 / 1.07;
+	public static final double MOTOR_kS = MOTOR_kV * 30;
+        
+	// ── Tuning constants ────────────────────────────────────────────────────
+	/** Voltage applied to indexer during ARMED (slow feed). */
+	private static final double INDEXER_SLOW_VOLTAGE = 2.0;
+	/** RPM tolerance — flywheel is "at speed" when error is within this. */
+	private static final double FLYWHEEL_READY_THRESHOLD_RPM = 50.0;
+	/** Hood angle tolerance (radians). */
+	private static final double HOOD_READY_THRESHOLD_RAD = 2.0 * PI / 180.0;
 
-	public static double MOTOR_kV = 0.0019203 / 1.07;
-	public static double MOTOR_kS = MOTOR_kV * 30;
+	// ── Operator setpoints ──────────────────────────────────────────────────
+	private double targetSpeedRpm = 0;
+	private double storedSpeedRpm = -4900;
+	private double targetHoodRad = 0;
 
+	// ── Shot bookkeeping ────────────────────────────────────────────────────
+	private int shotId = 0;
+	private boolean shootReadySent = false;
+
+	// ── NT: Robot → Camera publishers ───────────────────────────────────────
+	private BooleanPublisher shootReadyPub;
+	private IntegerPublisher shotIdPub;
+	private DoublePublisher shotSpeedRpmPub;
+	private DoublePublisher shotAngleDegPub;
+
+	// ── NT: Camera → Robot subscribers ──────────────────────────────────────
+	private StringSubscriber stateSub;
+	private BooleanSubscriber okToShootSub;
+	private BooleanSubscriber ballDetectedSub;
+	private IntegerSubscriber shotCountSub;
+	private DoubleSubscriber lastLandXSub;
+	private DoubleSubscriber lastLandYSub;
+	private DoubleSubscriber fpsSub;
+
+	// ── Misc ────────────────────────────────────────────────────────────────
+	private Command autonomousCommand;
+	private final RobotContainer robotContainer;
+
+	// =====================================================================
+	// Constructor
+	// =====================================================================
 	public Robot() {
-		Logger.recordMetadata("ProjectName", "MyProject"); // Set a metadata value
-
+		// AdvantageKit logging
+		Logger.recordMetadata("ProjectName", "BallTrackerProto");
 		Logger.addDataReceiver(new NT4Publisher());
 		Logger.start();
 
-		m_robotContainer = new RobotContainer();
+		robotContainer = new RobotContainer();
 	}
 
-	TurnSysID sysid = new TurnSysID();
-
+	// =====================================================================
+	// robotInit — hardware + NT setup
+	// =====================================================================
 	@Override
 	public void robotInit() {
-		// motor = new SparkFlex(25, MotorType.kBrushless);
-		motor = new TalonFX(0);
-		motor2 = new TalonFX(2);
+		// ── Motors ───────────────────────────────────────────────────────────
+		flywheel = new TalonFX(0);
+		flywheel2 = new TalonFX(2);
 		hood = new TalonFX(1);
+		indexer = new TalonFX(3);
+
 		hood.setPosition(0);
-		motor2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
 
-		TalonFXConfiguration config = new TalonFXConfiguration();
-		config.MotorOutput.NeutralMode = NeutralModeValue.Coast;
-		motor.getConfigurator().apply(config);
-		motor2.getConfigurator().apply(config);
-		motor2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
+		// Flywheel2 follows flywheel in opposite direction
+		flywheel2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
 
-		camera = new PhotonCamera("Arducam_OV9281_USB_Camera");
-		// left_js.button(1).onTrue(new InstantCommand(() -> {
-		//   double temp = store_speed;
-		//   store_speed = sp_speed;
-		//   sp_speed = temp;
-		// }));
-		// left_js.button(4).onTrue(new InstantCommand(() -> {
-		//   sp_speed -= 100;
-		// }));
-		// left_js.button(3).onTrue(new InstantCommand(() -> {
-		//   sp_speed += 100;
-		// }));
+		TalonFXConfiguration coastConfig = new TalonFXConfiguration();
+		coastConfig.MotorOutput.NeutralMode = NeutralModeValue.Coast;
+		flywheel.getConfigurator().apply(coastConfig);
+		flywheel2.getConfigurator().apply(coastConfig);
+		flywheel2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
+
+		TalonFXConfiguration brakeConfig = new TalonFXConfiguration();
+		brakeConfig.MotorOutput.NeutralMode = NeutralModeValue.Brake;
+		indexer.getConfigurator().apply(brakeConfig);
+
+		// ── NetworkTables — /BallTracker/ ───────────────────────────────────
+		NetworkTableInstance nt = NetworkTableInstance.getDefault();
+		NetworkTable table = nt.getTable("BallTracker");
+
+		// Robot → Camera
+		shootReadyPub = table.getBooleanTopic("robot/shoot_ready").publish();
+		shotIdPub = table.getIntegerTopic("robot/shot_id").publish();
+		shotSpeedRpmPub = table.getDoubleTopic("robot/shot_speed_rpm").publish();
+		shotAngleDegPub = table.getDoubleTopic("robot/shot_angle_deg").publish();
+
+		// Camera → Robot
+		stateSub = table.getStringTopic("camera/state").subscribe("CALIBRATING");
+		okToShootSub = table.getBooleanTopic("camera/ok_to_shoot").subscribe(false);
+		ballDetectedSub = table.getBooleanTopic("camera/ball_detected").subscribe(false);
+		shotCountSub = table.getIntegerTopic("camera/shot_count").subscribe(0);
+		lastLandXSub = table.getDoubleTopic("camera/last_land_x_cm").subscribe(0.0);
+		lastLandYSub = table.getDoubleTopic("camera/last_land_y_cm").subscribe(0.0);
+		fpsSub = table.getDoubleTopic("camera/fps").subscribe(0.0);
+
+		// Initialise published values
+		shootReadyPub.set(false);
+		shotIdPub.set(0);
+		shotSpeedRpmPub.set(0.0);
+		shotAngleDegPub.set(0.0);
+
+		// ── Controller bindings ─────────────────────────────────────────────
+		// A — swap between active speed and stored speed
 		controller.a().onTrue(new InstantCommand(() -> {
-			double temp = store_speed;
-			store_speed = sp_speed;
-			sp_speed = temp;
+			double tmp = storedSpeedRpm;
+			storedSpeedRpm = targetSpeedRpm;
+			targetSpeedRpm = tmp;
 		}));
-		controller.x().onTrue(new InstantCommand(() -> {
-			sp_speed -= 100;
-		}));
-		controller.b().onTrue(new InstantCommand(() -> {
-			sp_speed += 100;
-		}));
+		// X — decrease target speed by 100 RPM
+		controller.x().onTrue(new InstantCommand(() -> targetSpeedRpm -= 100));
+		// B — increase target speed by 100 RPM
+		controller.b().onTrue(new InstantCommand(() -> targetSpeedRpm += 100));
+		// POV Down — increase hood angle by 10°
+		controller.povDown().onTrue(new InstantCommand(() -> targetHoodRad += 10.0 / 180.0 * PI));
+		// POV Up — decrease hood angle by 10°
+		controller.povUp().onTrue(new InstantCommand(() -> targetHoodRad -= 10.0 / 180.0 * PI));
 
-		// controller.x().onTrue(new InstantCommand(()->{
-		//   hood.setPosition(0);
-		// }));
-		controller.povDown().onTrue(new InstantCommand(() -> {
-			sp_hood += 10 / 180. * PI;
-		}));
-		controller.povUp().onTrue(new InstantCommand(() -> {
-			sp_hood -= 10 / 180. * PI;
-		}));
-		// controller.y().onTrue(new InstantCommand(() -> {
-		//   double temp = store_hood;
-		//   store_hood = sp_hood;
-		//   sp_hood = temp;
-		// }));
-		SmartDashboard.putData("hoodPID", hpid);
-		// sysid.init();
+		SmartDashboard.putData("hoodPID", hoodPid);
 	}
 
+	// =====================================================================
+	// robotPeriodic — logging & NT reads
+	// =====================================================================
 	@Override
 	public void robotPeriodic() {
 		CommandScheduler.getInstance().run();
 
-		// Logger.recordOutput("Shooter/Speed", motor.getEncoder().getVelocity());
-		// Logger.recordOutput("Shooter/DutyCycleOutput", motor.getAppliedOutput());
-		// Logger.recordOutput("Shooter/Current", motor.getOutputCurrent());
-		// Logger.recordOutput("Shooter/SetpointSpeed", sp_speed);
-		// Logger.recordOutput("Shooter/BusVoltage", motor.getBusVoltage());
+		// ── Read camera values ──────────────────────────────────────────────
+		String cameraState = stateSub.get();
+		boolean okToShoot = okToShootSub.get();
+		boolean ballDetected = ballDetectedSub.get();
+		long shotCount = shotCountSub.get();
+		double landX = lastLandXSub.get();
+		double landY = lastLandYSub.get();
+		double cameraFps = fpsSub.get();
 
-		Logger.recordOutput("Shooter/Speed", motor.getVelocity().getValueAsDouble() * 60);
-		Logger.recordOutput("Shooter/DutyCycleOutput", motor.getMotorVoltage().getValueAsDouble());
-		Logger.recordOutput("Shooter/Current", motor.getStatorCurrent().getValueAsDouble());
-		Logger.recordOutput("Shooter/SetpointSpeed", sp_speed);
-		Logger.recordOutput("Shooter/BusVoltage", motor.getSupplyVoltage().getValueAsDouble());
-		Logger.recordOutput("Hood/Angle", hood.getPosition().getValueAsDouble() * 2 * PI);
-		Logger.recordOutput("Hood/AngleSetpoint", sp_hood);
+		// ── AdvantageKit logging ────────────────────────────────────────────
+		double flywheelRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
+		Logger.recordOutput("Shooter/Speed", flywheelRpm);
+		Logger.recordOutput("Shooter/Voltage", flywheel.getMotorVoltage().getValueAsDouble());
+		Logger.recordOutput("Shooter/Current", flywheel.getStatorCurrent().getValueAsDouble());
+		Logger.recordOutput("Shooter/SetpointSpeed", targetSpeedRpm);
+		Logger.recordOutput("Shooter/BusVoltage", flywheel.getSupplyVoltage().getValueAsDouble());
+		Logger.recordOutput("Hood/Angle", hood.getPosition().getValueAsDouble() * 2.0 * PI);
+		Logger.recordOutput("Hood/AngleSetpoint", targetHoodRad);
 		Logger.recordOutput("Hood/Voltage", hood.getMotorVoltage().getValueAsDouble());
+		Logger.recordOutput("Indexer/Voltage", indexer.getMotorVoltage().getValueAsDouble());
 
-		ArrayList<Double> dists = new ArrayList<>();
-		List<PhotonPipelineResult> res = camera.getAllUnreadResults();
-		for (PhotonPipelineResult r : res) {
-			for (PhotonTrackedTarget target : r.getTargets()) {
-				if (target.fiducialId == 21 || target.fiducialId == 24) {
-					dists.add(target.getBestCameraToTarget().getTranslation().getNorm());
-				}
-			}
+		Logger.recordOutput("BallTracker/CameraState", cameraState);
+		Logger.recordOutput("BallTracker/OkToShoot", okToShoot);
+		Logger.recordOutput("BallTracker/BallDetected", ballDetected);
+		Logger.recordOutput("BallTracker/ShotCount", shotCount);
+		Logger.recordOutput("BallTracker/LandX_cm", landX);
+		Logger.recordOutput("BallTracker/LandY_cm", landY);
+		Logger.recordOutput("BallTracker/CameraFPS", cameraFps);
+		Logger.recordOutput("BallTracker/ShotId", shotId);
+		Logger.recordOutput("BallTracker/ShootReadySent", shootReadySent);
+	}
+
+	// =====================================================================
+	// Teleop — BallTracker state machine
+	// =====================================================================
+	@Override
+	public void teleopInit() {
+		if (autonomousCommand != null) {
+			autonomousCommand.cancel();
 		}
-		double dist = 0;
-		for (double d : dists) dist += d;
-		if (dists.size() > 0) dist /= dists.size();
-		Logger.recordOutput("Distt", dist);
-		// System.out.println(dist);
+		// Reset protocol handshake state on teleop entry
+		shootReadySent = false;
+		shootReadyPub.set(false);
 	}
 
 	@Override
-	public void disabledInit() {}
+	public void teleopPeriodic() {
+		String cameraState = stateSub.get();
+		boolean okToShoot = okToShootSub.get();
+
+		// Flywheel and hood run continuously — always spin up and position
+		runFlywheel(targetSpeedRpm);
+		runHood(targetHoodRad);
+
+		// Only the indexer is gated by protocol state
+		switch (cameraState) {
+			case "CALIBRATING":
+				handleCalibrating();
+				break;
+			case "WAITING":
+				handleWaiting(okToShoot);
+				break;
+			case "ARMED":
+				handleArmed();
+				break;
+			case "TRACKING":
+				handleTracking();
+				break;
+			case "COOLDOWN":
+				handleCooldown();
+				break;
+			case "DONE":
+				handleDone();
+				break;
+			default:
+				// Unknown state — stop indexer only
+				stopIndexer();
+				break;
+		}
+	}
 
 	@Override
-	public void disabledPeriodic() {}
+	public void teleopExit() {
+		stopIndexer();
+		shootReadyPub.set(false);
+	}
 
-	@Override
-	public void disabledExit() {}
+	// =====================================================================
+	// State handlers
+	// =====================================================================
 
+	/**
+	 * CALIBRATING — camera is detecting AprilTags. Indexer off; flywheel + hood keep running.
+	 */
+	private void handleCalibrating() {
+		stopIndexer();
+		shootReadySent = false;
+	}
+
+	/**
+	 * WAITING — camera is ready (ok_to_shoot = true). Flywheel and hood are already
+	 * running continuously. Once both are at setpoint, set shoot_ready = true.
+	 */
+	private void handleWaiting(boolean okToShoot) {
+		// Indexer stays off during WAITING
+		stopIndexer();
+
+		// Reset shoot_ready flag each time we are in WAITING (after DONE cleared it)
+		if (shootReadySent) {
+			shootReadySent = false;
+			shootReadyPub.set(false);
+		}
+
+		if (!okToShoot) {
+			// Camera not ready yet — don't signal
+			return;
+		}
+
+		// Check if flywheel and hood are at setpoint
+		double flywheelRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
+		double hoodAngleRad = hood.getPosition().getValueAsDouble() * 2.0 * PI;
+		boolean flywheelReady = abs(flywheelRpm - targetSpeedRpm) < FLYWHEEL_READY_THRESHOLD_RPM;
+		boolean hoodReady = abs(hoodAngleRad - targetHoodRad) < HOOD_READY_THRESHOLD_RAD;
+
+		if (flywheelReady && hoodReady && abs(targetSpeedRpm) > 0) {
+			// Publish shot metadata then signal shoot_ready
+			shotId++;
+			shotIdPub.set(shotId);
+			shotSpeedRpmPub.set(targetSpeedRpm);
+			shotAngleDegPub.set(targetHoodRad / PI * 180.0);
+			shootReadyPub.set(true);
+			shootReadySent = true;
+		}
+	}
+
+	/**
+	 * ARMED — camera is watching for the ball. Flywheel + hood already running.
+	 * Slowly feed the indexer to push a ball into the shooter.
+	 */
+	private void handleArmed() {
+		// Slowly feed ball — flywheel and hood are already being driven above
+		indexer.setVoltage(INDEXER_SLOW_VOLTAGE);
+	}
+
+	/**
+	 * TRACKING — ball is in flight. Stop indexer only; flywheel + hood keep running.
+	 */
+	private void handleTracking() {
+		stopIndexer();
+	}
+
+	/**
+	 * COOLDOWN — ball may be bouncing. Stop indexer only; flywheel + hood keep running.
+	 */
+	private void handleCooldown() {
+		stopIndexer();
+	}
+
+	/**
+	 * DONE — shot recorded, momentary state. Clear shoot_ready; stop indexer.
+	 */
+	private void handleDone() {
+		stopIndexer();
+		// Clear shoot_ready so camera sees the falling edge
+		shootReadySent = false;
+		shootReadyPub.set(false);
+	}
+
+	// =====================================================================
+	// Motor helpers
+	// =====================================================================
+
+	/** Run the flywheel at the given RPM using feedforward + PID. */
+	private void runFlywheel(double setpointRpm) {
+		double currentRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
+		double voltage = signum(setpointRpm) * MOTOR_kS
+				+ setpointRpm * MOTOR_kV
+				+ flywheelPid.calculate(currentRpm, setpointRpm);
+		flywheel.setVoltage(voltage);
+	}
+
+	/** Run the hood to the given angle (radians) using PID. */
+	private void runHood(double setpointRad) {
+		double currentRad = hood.getPosition().getValueAsDouble() * 2.0 * PI;
+		double voltage = MathUtil.clamp(hoodPid.calculate(currentRad, setpointRad), -1, 1);
+		hood.setVoltage(voltage);
+	}
+
+	/** Stop the indexer only. Flywheel and hood are never stopped by the state machine. */
+	private void stopIndexer() {
+		indexer.setVoltage(0);
+	}
+
+	// =====================================================================
+	// Autonomous
+	// =====================================================================
 	@Override
 	public void autonomousInit() {
-		m_autonomousCommand = m_robotContainer.getAutonomousCommand();
-
-		if (m_autonomousCommand != null) {
-			CommandScheduler.getInstance().schedule(m_autonomousCommand);
+		autonomousCommand = robotContainer.getAutonomousCommand();
+		if (autonomousCommand != null) {
+			CommandScheduler.getInstance().schedule(autonomousCommand);
 		}
 	}
 
@@ -177,34 +393,24 @@ public class Robot extends LoggedRobot {
 	@Override
 	public void autonomousExit() {}
 
+	// =====================================================================
+	// Disabled
+	// =====================================================================
 	@Override
-	public void teleopInit() {
-		if (m_autonomousCommand != null) {
-			m_autonomousCommand.cancel();
-		}
-	}
-
-	double sp_speed = 0;
-	double store_speed = -4900;
-	double sp_hood = 0;
-	double store_hood = -2 * PI;
-
-	@Override
-	public void teleopPeriodic() {
-		// double cur_speed = motor.getEncoder().getVelocity();
-		double cur_speed = motor.getVelocity().getValueAsDouble() * 60;
-		// System.out.println(sp_speed + " " + store_speed);
-
-		// motor.set(Math.abs(cur_speed) < Math.abs(sp_speed) ? Math.signum(sp_speed) : 0);
-		// System.out.println(Math.abs(cur_speed) < Math.abs(sp_speed) ? Math.signum(sp_speed) : 0);
-		motor.setVoltage(Math.signum(sp_speed) * MOTOR_kS + sp_speed * MOTOR_kV + pid.calculate(cur_speed, sp_speed));
-
-		hood.setVoltage(MathUtil.clamp(hpid.calculate(hood.getPosition().getValueAsDouble() * 2 * PI, sp_hood), -1, 1));
+	public void disabledInit() {
+		stopIndexer();
+		shootReadyPub.set(false);
 	}
 
 	@Override
-	public void teleopExit() {}
+	public void disabledPeriodic() {}
 
+	@Override
+	public void disabledExit() {}
+
+	// =====================================================================
+	// Test
+	// =====================================================================
 	@Override
 	public void testInit() {
 		CommandScheduler.getInstance().cancelAll();
