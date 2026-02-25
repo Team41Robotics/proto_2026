@@ -2,12 +2,12 @@ package frc.robot;
 
 import static java.lang.Math.*;
 
-import com.ctre.phoenix6.configs.TalonFXConfiguration;
-import com.ctre.phoenix6.controls.Follower;
-import com.ctre.phoenix6.hardware.TalonFX;
-import com.ctre.phoenix6.signals.MotorAlignmentValue;
-import com.ctre.phoenix6.signals.NeutralModeValue;
-import edu.wpi.first.math.MathUtil;
+import com.revrobotics.spark.SparkBase.PersistMode;
+import com.revrobotics.spark.SparkBase.ResetMode;
+import com.revrobotics.spark.SparkFlex;
+import com.revrobotics.spark.SparkLowLevel.MotorType;
+import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
+import com.revrobotics.spark.config.SparkFlexConfig;
 import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.networktables.BooleanPublisher;
 import edu.wpi.first.networktables.BooleanSubscriber;
@@ -18,7 +18,6 @@ import edu.wpi.first.networktables.IntegerSubscriber;
 import edu.wpi.first.networktables.NetworkTable;
 import edu.wpi.first.networktables.NetworkTableInstance;
 import edu.wpi.first.networktables.StringSubscriber;
-import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import edu.wpi.first.wpilibj2.command.InstantCommand;
@@ -39,37 +38,31 @@ public class Robot extends LoggedRobot {
 
 	// ── Hardware ────────────────────────────────────────────────────────────
 	/** Flywheel primary motor (CAN 0). */
-	private TalonFX flywheel;
+	private SparkFlex flywheel;
 	/** Flywheel follower motor (CAN 2, opposed). */
-	private TalonFX flywheel2;
-	/** Hood / pivot motor (CAN 1). */
-	private TalonFX hood;
+	private SparkFlex flywheel2;
 	/** Indexer motor to feed balls into the shooter (CAN 3). */
-	private TalonFX indexer;
+	private SparkFlex indexer;
 
 	// ── Controls ────────────────────────────────────────────────────────────
 	private final CommandXboxController controller = new CommandXboxController(1);
 
 	// ── PID ─────────────────────────────────────────────────────────────────
 	private final PIDController flywheelPid = new PIDController(0, 0, 0);
-	private final PIDController hoodPid = new PIDController(0.5, 0.1, 0);
 
 	// ── Feedforward constants ───────────────────────────────────────────────
-	public static final double MOTOR_kV = 0.0019203 / 1.07;
+	public static final double MOTOR_kV = 0.0019203;
 	public static final double MOTOR_kS = MOTOR_kV * 30;
-        
+
 	// ── Tuning constants ────────────────────────────────────────────────────
 	/** Voltage applied to indexer during ARMED (slow feed). */
 	private static final double INDEXER_SLOW_VOLTAGE = 2.0;
 	/** RPM tolerance — flywheel is "at speed" when error is within this. */
 	private static final double FLYWHEEL_READY_THRESHOLD_RPM = 50.0;
-	/** Hood angle tolerance (radians). */
-	private static final double HOOD_READY_THRESHOLD_RAD = 2.0 * PI / 180.0;
 
 	// ── Operator setpoints ──────────────────────────────────────────────────
 	private double targetSpeedRpm = 0;
 	private double storedSpeedRpm = -4900;
-	private double targetHoodRad = 0;
 
 	// ── Shot bookkeeping ────────────────────────────────────────────────────
 	private int shotId = 0;
@@ -79,7 +72,6 @@ public class Robot extends LoggedRobot {
 	private BooleanPublisher shootReadyPub;
 	private IntegerPublisher shotIdPub;
 	private DoublePublisher shotSpeedRpmPub;
-	private DoublePublisher shotAngleDegPub;
 
 	// ── NT: Camera → Robot subscribers ──────────────────────────────────────
 	private StringSubscriber stateSub;
@@ -112,25 +104,22 @@ public class Robot extends LoggedRobot {
 	@Override
 	public void robotInit() {
 		// ── Motors ───────────────────────────────────────────────────────────
-		flywheel = new TalonFX(0);
-		flywheel2 = new TalonFX(2);
-		hood = new TalonFX(1);
-		indexer = new TalonFX(3);
+		flywheel = new SparkFlex(41, MotorType.kBrushless);
+		flywheel2 = new SparkFlex(26, MotorType.kBrushless);
+		indexer = new SparkFlex(25, MotorType.kBrushless);
 
-		hood.setPosition(0);
+		SparkFlexConfig flywheelConfig = new SparkFlexConfig();
+		flywheelConfig.idleMode(IdleMode.kCoast);
+		flywheel.configure(flywheelConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
 
-		// Flywheel2 follows flywheel in opposite direction
-		flywheel2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
+		// flywheel2 follows flywheel in opposite direction
+		SparkFlexConfig flywheel2Config = new SparkFlexConfig();
+		flywheel2Config.idleMode(IdleMode.kCoast).follow(flywheel, true);
+		flywheel2.configure(flywheel2Config, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
 
-		TalonFXConfiguration coastConfig = new TalonFXConfiguration();
-		coastConfig.MotorOutput.NeutralMode = NeutralModeValue.Coast;
-		flywheel.getConfigurator().apply(coastConfig);
-		flywheel2.getConfigurator().apply(coastConfig);
-		flywheel2.setControl(new Follower(0, MotorAlignmentValue.Opposed));
-
-		TalonFXConfiguration brakeConfig = new TalonFXConfiguration();
-		brakeConfig.MotorOutput.NeutralMode = NeutralModeValue.Brake;
-		indexer.getConfigurator().apply(brakeConfig);
+		SparkFlexConfig indexerConfig = new SparkFlexConfig();
+		indexerConfig.idleMode(IdleMode.kBrake);
+		indexer.configure(indexerConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
 
 		// ── NetworkTables — /BallTracker/ ───────────────────────────────────
 		NetworkTableInstance nt = NetworkTableInstance.getDefault();
@@ -140,7 +129,6 @@ public class Robot extends LoggedRobot {
 		shootReadyPub = table.getBooleanTopic("robot/shoot_ready").publish();
 		shotIdPub = table.getIntegerTopic("robot/shot_id").publish();
 		shotSpeedRpmPub = table.getDoubleTopic("robot/shot_speed_rpm").publish();
-		shotAngleDegPub = table.getDoubleTopic("robot/shot_angle_deg").publish();
 
 		// Camera → Robot
 		stateSub = table.getStringTopic("camera/state").subscribe("CALIBRATING");
@@ -155,7 +143,6 @@ public class Robot extends LoggedRobot {
 		shootReadyPub.set(false);
 		shotIdPub.set(0);
 		shotSpeedRpmPub.set(0.0);
-		shotAngleDegPub.set(0.0);
 
 		// ── Controller bindings ─────────────────────────────────────────────
 		// A — swap between active speed and stored speed
@@ -168,12 +155,6 @@ public class Robot extends LoggedRobot {
 		controller.x().onTrue(new InstantCommand(() -> targetSpeedRpm -= 100));
 		// B — increase target speed by 100 RPM
 		controller.b().onTrue(new InstantCommand(() -> targetSpeedRpm += 100));
-		// POV Down — increase hood angle by 10°
-		controller.povDown().onTrue(new InstantCommand(() -> targetHoodRad += 10.0 / 180.0 * PI));
-		// POV Up — decrease hood angle by 10°
-		controller.povUp().onTrue(new InstantCommand(() -> targetHoodRad -= 10.0 / 180.0 * PI));
-
-		SmartDashboard.putData("hoodPID", hoodPid);
 	}
 
 	// =====================================================================
@@ -193,16 +174,13 @@ public class Robot extends LoggedRobot {
 		double cameraFps = fpsSub.get();
 
 		// ── AdvantageKit logging ────────────────────────────────────────────
-		double flywheelRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
+		double flywheelRpm = flywheel.getEncoder().getVelocity();
 		Logger.recordOutput("Shooter/Speed", flywheelRpm);
-		Logger.recordOutput("Shooter/Voltage", flywheel.getMotorVoltage().getValueAsDouble());
-		Logger.recordOutput("Shooter/Current", flywheel.getStatorCurrent().getValueAsDouble());
+		Logger.recordOutput("Shooter/Voltage", flywheel.getAppliedOutput() * flywheel.getBusVoltage());
+		Logger.recordOutput("Shooter/Current", flywheel.getOutputCurrent());
 		Logger.recordOutput("Shooter/SetpointSpeed", targetSpeedRpm);
-		Logger.recordOutput("Shooter/BusVoltage", flywheel.getSupplyVoltage().getValueAsDouble());
-		Logger.recordOutput("Hood/Angle", hood.getPosition().getValueAsDouble() * 2.0 * PI);
-		Logger.recordOutput("Hood/AngleSetpoint", targetHoodRad);
-		Logger.recordOutput("Hood/Voltage", hood.getMotorVoltage().getValueAsDouble());
-		Logger.recordOutput("Indexer/Voltage", indexer.getMotorVoltage().getValueAsDouble());
+		Logger.recordOutput("Shooter/BusVoltage", flywheel.getBusVoltage());
+		Logger.recordOutput("Indexer/Voltage", indexer.getAppliedOutput() * indexer.getBusVoltage());
 
 		Logger.recordOutput("BallTracker/CameraState", cameraState);
 		Logger.recordOutput("BallTracker/OkToShoot", okToShoot);
@@ -233,9 +211,8 @@ public class Robot extends LoggedRobot {
 		String cameraState = stateSub.get();
 		boolean okToShoot = okToShootSub.get();
 
-		// Flywheel and hood run continuously — always spin up and position
+		// Flywheel runs continuously — always spin up
 		runFlywheel(targetSpeedRpm);
-		runHood(targetHoodRad);
 
 		// Only the indexer is gated by protocol state
 		switch (cameraState) {
@@ -275,7 +252,7 @@ public class Robot extends LoggedRobot {
 	// =====================================================================
 
 	/**
-	 * CALIBRATING — camera is detecting AprilTags. Indexer off; flywheel + hood keep running.
+	 * CALIBRATING — camera is detecting AprilTags. Indexer off; flywheel keeps running.
 	 */
 	private void handleCalibrating() {
 		stopIndexer();
@@ -283,8 +260,8 @@ public class Robot extends LoggedRobot {
 	}
 
 	/**
-	 * WAITING — camera is ready (ok_to_shoot = true). Flywheel and hood are already
-	 * running continuously. Once both are at setpoint, set shoot_ready = true.
+	 * WAITING — camera is ready (ok_to_shoot = true). Flywheel is already
+	 * running continuously. Once it is at setpoint, set shoot_ready = true.
 	 */
 	private void handleWaiting(boolean okToShoot) {
 		// Indexer stays off during WAITING
@@ -301,41 +278,38 @@ public class Robot extends LoggedRobot {
 			return;
 		}
 
-		// Check if flywheel and hood are at setpoint
-		double flywheelRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
-		double hoodAngleRad = hood.getPosition().getValueAsDouble() * 2.0 * PI;
+		// Check if flywheel is at setpoint
+		double flywheelRpm = flywheel.getEncoder().getVelocity();
 		boolean flywheelReady = abs(flywheelRpm - targetSpeedRpm) < FLYWHEEL_READY_THRESHOLD_RPM;
-		boolean hoodReady = abs(hoodAngleRad - targetHoodRad) < HOOD_READY_THRESHOLD_RAD;
 
-		if (flywheelReady && hoodReady && abs(targetSpeedRpm) > 0) {
+		if (flywheelReady && abs(targetSpeedRpm) > 0) {
 			// Publish shot metadata then signal shoot_ready
 			shotId++;
 			shotIdPub.set(shotId);
 			shotSpeedRpmPub.set(targetSpeedRpm);
-			shotAngleDegPub.set(targetHoodRad / PI * 180.0);
 			shootReadyPub.set(true);
 			shootReadySent = true;
 		}
 	}
 
 	/**
-	 * ARMED — camera is watching for the ball. Flywheel + hood already running.
+	 * ARMED — camera is watching for the ball. Flywheel already running.
 	 * Slowly feed the indexer to push a ball into the shooter.
 	 */
 	private void handleArmed() {
-		// Slowly feed ball — flywheel and hood are already being driven above
+		// Slowly feed ball — flywheel is already being driven above
 		indexer.setVoltage(INDEXER_SLOW_VOLTAGE);
 	}
 
 	/**
-	 * TRACKING — ball is in flight. Stop indexer only; flywheel + hood keep running.
+	 * TRACKING — ball is in flight. Stop indexer only; flywheel keeps running.
 	 */
 	private void handleTracking() {
 		stopIndexer();
 	}
 
 	/**
-	 * COOLDOWN — ball may be bouncing. Stop indexer only; flywheel + hood keep running.
+	 * COOLDOWN — ball may be bouncing. Stop indexer only; flywheel keeps running.
 	 */
 	private void handleCooldown() {
 		stopIndexer();
@@ -357,21 +331,14 @@ public class Robot extends LoggedRobot {
 
 	/** Run the flywheel at the given RPM using feedforward + PID. */
 	private void runFlywheel(double setpointRpm) {
-		double currentRpm = flywheel.getVelocity().getValueAsDouble() * 60.0;
+		double currentRpm = flywheel.getEncoder().getVelocity();
 		double voltage = signum(setpointRpm) * MOTOR_kS
 				+ setpointRpm * MOTOR_kV
 				+ flywheelPid.calculate(currentRpm, setpointRpm);
 		flywheel.setVoltage(voltage);
 	}
 
-	/** Run the hood to the given angle (radians) using PID. */
-	private void runHood(double setpointRad) {
-		double currentRad = hood.getPosition().getValueAsDouble() * 2.0 * PI;
-		double voltage = MathUtil.clamp(hoodPid.calculate(currentRad, setpointRad), -1, 1);
-		hood.setVoltage(voltage);
-	}
-
-	/** Stop the indexer only. Flywheel and hood are never stopped by the state machine. */
+	/** Stop the indexer only. Flywheel is never stopped by the state machine. */
 	private void stopIndexer() {
 		indexer.setVoltage(0);
 	}
